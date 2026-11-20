@@ -2,16 +2,32 @@
 
 提供转换后数据的质量校验能力，包括必填字段检查、类型校验、
 数值范围校验和完整性评分。
+
+跨模块取值明细：
+    data_transform 在调用 :meth:`validate_record` 时通过 ``context`` 传入
+    「目标字段取值明细」（field_value_details）。本模块跨模块读取该明细，
+    使每条校验都指向本次实际采用的来源字段，并按“采用的金额”执行上限检查；
+    明细中的候选值、取值口径、来源以及未采用候选会一并写入质检台账。
+
+阻断与台账：
+    阻断策略为「阻断」且校验不通过时，结果不会同步到下游（返回 ``blocked=True``），
+    但阻断事实及完整取值明细仍会登记到质检台账（json_store 持久化分区
+    ``quality_ledger``），台账中可查到实际转换的数据值与未采用的候选值。
+
 跨模块关联：data_transform（转换后校验）、batch_ingest（批量质量检查）。
 """
 from __future__ import annotations
 
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
 from app.persistence import json_store
 from app.services.base import BaseModuleService
+
+# 质检台账在 json_store 中的持久化分区键
+LEDGER_KEY = "quality_ledger"
 
 
 class DataQualityRuleService(BaseModuleService):
@@ -27,19 +43,39 @@ class DataQualityRuleService(BaseModuleService):
     def __init__(self) -> None:
         super().__init__()
         self._validation_history: list[dict[str, Any]] = []
+        self._history_lock = threading.Lock()
 
-    def validate_record(self, record: dict[str, Any], source_module: str = "") -> dict[str, Any]:
+    def validate_record(
+        self,
+        record: dict[str, Any],
+        source_module: str = "",
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """对单条记录执行质量校验。
 
         校验流程：
         1. 加载与该来源相关的已生效规则
         2. 逐条规则执行校验表达式
-        3. 检查数值范围（阈值上下界）
-        4. 根据阻断策略决定是否拒绝
+        3. 检查数值范围（阈值上下界，按实际采用值执行）
+        4. 根据阻断策略决定是否拒绝，并登记质检台账
+
+        Args:
+            record: 转换后的目标记录（实际业务值）。
+            source_module: 触发校验的来源模块（如 data_transform）。
+            context: 跨模块上下文，可包含
+                ``transform_rule_id`` 与 ``field_value_details``
+                （目标字段取值明细：候选值、取值口径、来源、采用值）。
 
         Returns:
-            { passed: bool, checks: int, failed: int, details: list, score: int }
+            { passed, checks, failed, details, score, blocked?, ledger_entry? }
         """
+        context = context or {}
+        field_details = {
+            item.get("target_field"): item
+            for item in context.get("field_value_details", [])
+            if isinstance(item, dict)
+        }
+
         rules = json_store.get_all(self.MODULE)
         matching = [
             r for r in rules
@@ -55,6 +91,7 @@ class DataQualityRuleService(BaseModuleService):
         results = []
         total_passed = 0
         total_failed = 0
+        blocking_failure: dict[str, Any] | None = None
 
         for rule in matching:
             field = str(rule.get("校验字段", ""))
@@ -68,7 +105,7 @@ class DataQualityRuleService(BaseModuleService):
                 upper = 0
 
             check_result = self._execute_check(record, field, expression)
-            range_check = self._check_range(record, field, lower, upper)
+            range_check = self._check_range(record, field, lower, upper, field_details)
 
             passed = check_result.get("passed", True) and range_check.get("passed", True)
             detail = {
@@ -79,6 +116,10 @@ class DataQualityRuleService(BaseModuleService):
                 "expr_result": check_result,
                 "range_result": range_check,
                 "block_policy": block_policy,
+                # 指向本次实际使用的来源字段与取值口径
+                "value_source": range_check.get("value_source"),
+                "value_caliber": range_check.get("value_caliber"),
+                "checked_value": range_check.get("checked_value", record.get(field)),
             }
             results.append(detail)
 
@@ -86,30 +127,51 @@ class DataQualityRuleService(BaseModuleService):
                 total_passed += 1
             else:
                 total_failed += 1
-                if block_policy == "阻断":
-                    self._validation_history.append({
-                        "rule": rule.get("规则编号"),
-                        "field": field,
-                        "outcome": "blocked",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    return {
-                        "passed": False,
-                        "checks": len(matching),
-                        "failed": total_failed,
-                        "passed_checks": total_passed,
-                        "details": results,
-                        "score": max(0, 100 - total_failed * 10),
-                        "blocked": True,
+                if block_policy == "阻断" and blocking_failure is None:
+                    blocking_failure = {
+                        "rule": rule,
+                        "detail": detail,
+                        "total_failed": total_failed,
+                        "total_passed": total_passed,
+                        "results": list(results),
+                        "matching_count": len(matching),
                     }
 
-        self._validation_history.append({
-            "record_preview": str(record)[:100],
-            "checks": len(matching),
-            "passed": total_passed,
-            "failed": total_failed,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
+        score = max(0, 100 - total_failed * 10)
+        ledger_entry = self._record_ledger(
+            record=record,
+            source_module=source_module,
+            context=context,
+            check_details=results,
+            total_passed=total_passed,
+            total_failed=total_failed,
+            blocking_failure=blocking_failure,
+            score=score,
+        )
+
+        with self._history_lock:
+            self._validation_history.append({
+                "record_preview": str(record)[:100],
+                "checks": len(matching),
+                "passed": total_passed,
+                "failed": total_failed,
+                "blocked": blocking_failure is not None,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+        if blocking_failure is not None:
+            return {
+                "passed": False,
+                "checks": blocking_failure["matching_count"],
+                "failed": total_failed,
+                "passed_checks": total_passed,
+                "details": results,
+                "score": score,
+                "blocked": True,
+                "blocked_rule": blocking_failure["rule"].get("规则编号"),
+                "ledger_entry_id": ledger_entry["id"],
+                "ledger_entry": ledger_entry,
+            }
 
         return {
             "passed": total_failed == 0,
@@ -117,9 +179,137 @@ class DataQualityRuleService(BaseModuleService):
             "failed": total_failed,
             "passed_checks": total_passed,
             "details": results,
-            "score": max(0, 100 - total_failed * 10),
+            "score": score,
+            "ledger_entry_id": ledger_entry["id"],
+            "ledger_entry": ledger_entry,
         }
 
+    # ------------------------------------------------------------------
+    # 质检台账
+    # ------------------------------------------------------------------
+    def _record_ledger(
+        self,
+        *,
+        record: dict[str, Any],
+        source_module: str,
+        context: dict[str, Any],
+        check_details: list[dict[str, Any]],
+        total_passed: int,
+        total_failed: int,
+        blocking_failure: dict[str, Any] | None,
+        score: int,
+    ) -> dict[str, Any]:
+        """把一次校验（含阻断）登记到质检台账，保留采用值与全部候选值。"""
+        field_value_details = context.get("field_value_details", [])
+        # 台账行：实际转换的数据值 + 候选值/取值口径/来源 + 未采用候选
+        field_rows = []
+        for item in field_value_details:
+            field_rows.append({
+                "target_field": item.get("target_field"),
+                "adopted_value": item.get("adopted"),
+                "adopted_source": item.get("adopted_source"),
+                "adopted_caliber": item.get("adopted_caliber"),
+                "selection_strategy": item.get("selection_strategy"),
+                "strategy_label": item.get("strategy_label"),
+                "candidates": [
+                    {
+                        "source_path": c.get("source_path"),
+                        "caliber": c.get("caliber"),
+                        "raw_value": c.get("raw_value"),
+                        "converted_value": c.get("converted_value"),
+                        "parseable": c.get("parseable"),
+                        "adopted": c.get("adopted", False),
+                    }
+                    for c in item.get("candidates", [])
+                ],
+                "rejected_candidates": [
+                    {
+                        "source_path": c.get("source_path"),
+                        "caliber": c.get("caliber"),
+                        "converted_value": c.get("converted_value"),
+                    }
+                    for c in item.get("candidates", [])
+                    if not c.get("adopted", False)
+                ],
+            })
+
+        failed_details = [d for d in check_details if not d.get("passed")]
+        entry = {
+            "ledger_no": f"QL-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source_module": source_module,
+            "transform_rule_id": context.get("transform_rule_id"),
+            "outcome": "blocked" if blocking_failure is not None else (
+                "warning" if total_failed else "passed"
+            ),
+            "blocked": blocking_failure is not None,
+            "passed": total_failed == 0,
+            "checks_passed": total_passed,
+            "checks_failed": total_failed,
+            "score": score,
+            "blocked_rule": blocking_failure["rule"].get("规则编号") if blocking_failure else None,
+            "blocked_field": blocking_failure["detail"].get("field") if blocking_failure else None,
+            "actual_data": record,
+            "field_value_details": field_rows,
+            "check_details": check_details,
+            "failure_messages": [
+                self._summarize_failure(detail) for detail in failed_details
+            ],
+        }
+        return json_store.insert(LEDGER_KEY, entry)
+
+    @staticmethod
+    def _summarize_failure(detail: dict[str, Any]) -> str:
+        """汇总一条失败校验的可读原因。"""
+        messages = []
+        range_result = detail.get("range_result") or {}
+        expr_result = detail.get("expr_result") or {}
+        if not range_result.get("passed", True):
+            messages.append(range_result.get("message", "范围校验失败"))
+        if not expr_result.get("passed", True):
+            messages.append(expr_result.get("message", "表达式校验失败"))
+        return f"规则 {detail.get('rule_no')} 字段 {detail.get('field')}: {'；'.join(messages)}"
+
+    def query_quality_ledger(
+        self,
+        *,
+        blocked: bool | None = None,
+        target_field: str | None = None,
+        source_module: str | None = None,
+        page: int = 1,
+        size: int = 20,
+    ) -> dict[str, Any]:
+        """查询质检台账，支持按阻断状态、目标字段、来源模块过滤。"""
+        rows = json_store.get_all(LEDGER_KEY)
+        if blocked is not None:
+            rows = [r for r in rows if bool(r.get("blocked")) == blocked]
+        if source_module:
+            rows = [r for r in rows if str(r.get("source_module", "")) == source_module]
+        if target_field:
+            rows = [
+                r for r in rows
+                if any(
+                    str(f.get("target_field", "")) == target_field
+                    for f in r.get("field_value_details", [])
+                )
+            ]
+        rows = sorted(rows, key=lambda r: int(r.get("id", 0)), reverse=True)
+        total = len(rows)
+        start = (max(page, 1) - 1) * size
+        return {
+            "items": rows[start:start + size],
+            "total": total,
+            "page": page,
+            "size": size,
+        }
+
+    def get_ledger_entry(self, entry_id: int) -> dict[str, Any] | None:
+        """按台账记录ID读取完整台账（含采用值与未采用候选值）。"""
+        return json_store.get_by_id(LEDGER_KEY, entry_id)
+
+    # ------------------------------------------------------------------
+    # 校验执行
+    # ------------------------------------------------------------------
     def _execute_check(self, record: dict[str, Any], field: str, expression: str) -> dict[str, Any]:
         """执行校验表达式。
 
@@ -165,23 +355,70 @@ class DataQualityRuleService(BaseModuleService):
 
         return {"passed": True, "message": "未识别表达式，默认通过"}
 
-    def _check_range(self, record: dict[str, Any], field: str, lower: float, upper: float) -> dict[str, Any]:
-        """检查字段值是否在阈值范围内。"""
+    def _check_range(
+        self,
+        record: dict[str, Any],
+        field: str,
+        lower: float,
+        upper: float,
+        field_details: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """检查字段值是否在阈值范围内。
+
+        跨模块读取目标字段取值明细时，范围检查按本次实际采用值执行，
+        并回传该值的来源字段与取值口径，使质检能指向本次使用的字段。
+        """
+        field_details = field_details or {}
         if lower == 0 and upper == 0:
-            return {"passed": True, "message": "无范围限制"}
+            return {
+                "passed": True,
+                "message": "无范围限制",
+                "checked_value": record.get(field),
+                "value_source": field_details.get(field, {}).get("adopted_source"),
+                "value_caliber": field_details.get(field, {}).get("adopted_caliber"),
+            }
 
         value = record.get(field)
+        detail = field_details.get(field) or {}
         try:
             num_value = float(str(value))
         except (ValueError, TypeError):
-            return {"passed": True, "message": "非数值字段跳过范围检查"}
+            return {
+                "passed": True,
+                "message": "非数值字段跳过范围检查",
+                "checked_value": value,
+                "value_source": detail.get("adopted_source"),
+                "value_caliber": detail.get("adopted_caliber"),
+            }
+
+        source_hint = detail.get("adopted_source")
+        caliber_hint = detail.get("adopted_caliber")
+        hint = f"（采用来源 {source_hint} / {caliber_hint}）" if source_hint else ""
 
         if lower > 0 and num_value < lower:
-            return {"passed": False, "message": f"值 {num_value} 低于阈值 {lower}"}
+            return {
+                "passed": False,
+                "message": f"采用值 {num_value} 低于阈值 {lower}{hint}",
+                "checked_value": num_value,
+                "value_source": source_hint,
+                "value_caliber": caliber_hint,
+            }
         if upper > 0 and num_value > upper:
-            return {"passed": False, "message": f"值 {num_value} 超过阈值 {upper}"}
+            return {
+                "passed": False,
+                "message": f"采用值 {num_value} 超过上限 {upper}{hint}",
+                "checked_value": num_value,
+                "value_source": source_hint,
+                "value_caliber": caliber_hint,
+            }
 
-        return {"passed": True, "message": f"值 {num_value} 在范围 [{lower}, {upper}] 内"}
+        return {
+            "passed": True,
+            "message": f"采用值 {num_value} 在范围 [{lower}, {upper}] 内{hint}",
+            "checked_value": num_value,
+            "value_source": source_hint,
+            "value_caliber": caliber_hint,
+        }
 
     def validate_batch(self, records: list[dict[str, Any]], source_module: str = "") -> dict[str, Any]:
         """批量质量校验。"""
@@ -215,15 +452,19 @@ class DataQualityRuleService(BaseModuleService):
 
     def get_quality_report(self) -> dict[str, Any]:
         """获取质量校验报告。"""
-        history = self._validation_history[-100:]
+        with self._history_lock:
+            history = list(self._validation_history[-100:])
         rules = json_store.get_all(self.MODULE)
         active_rules = sum(1 for r in rules if r.get("status") == "已生效")
+        ledger_rows = json_store.get_all(LEDGER_KEY)
 
         return {
             "active_rules": active_rules,
             "total_checks": len(history),
             "recent_failures": sum(1 for h in history if h.get("failed", 0) > 0),
             "recent_blocks": sum(1 for h in history if h.get("blocked")),
+            "ledger_total": len(ledger_rows),
+            "ledger_blocked": sum(1 for r in ledger_rows if r.get("blocked")),
         }
 
     def domain_snapshot(self) -> dict[str, Any]:
@@ -244,5 +485,9 @@ class DataQualityRuleService(BaseModuleService):
             "abnormal": sum(1 for r in rows if r.get("abnormal")),
             "total_validations": len(self._validation_history),
             "active_rules": sum(1 for r in rows if r.get("status") == "已生效"),
+            "ledger_total": len(json_store.get_all(LEDGER_KEY)),
+            "ledger_blocked": sum(
+                1 for r in json_store.get_all(LEDGER_KEY) if r.get("blocked")
+            ),
             "operation": self.OPERATION_TERM,
         }

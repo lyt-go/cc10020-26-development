@@ -43,6 +43,12 @@ class TransformRequest(BaseModel):
     source_data: list[dict[str, Any]]
 
 
+class TransformRunRequest(BaseModel):
+    rule_id: int
+    source_data: dict[str, Any]
+    idempotency_key: str | None = None
+
+
 class ValidationRequest(BaseModel):
     records: list[dict[str, Any]]
     source_module: str = ""
@@ -133,6 +139,53 @@ def pipeline_transform_validate(request: TransformRequest) -> dict[str, Any]:
     transform_svc = DataTransformService()
     batch_result = transform_svc.batch_transform(rule_id=request.rule_id, source_records=request.source_data)
     return batch_result
+
+
+@router.post("/transform/run")
+def pipeline_transform_run(request: TransformRunRequest) -> dict[str, Any]:
+    """数据转换单条执行：保留目标字段取值明细（候选值/取值口径/来源）。
+
+    同一映射版本对同一输入的并发调用经单飞合并，只产生一个实际业务值；
+    质量校验按采用值执行，阻断时结果携带 ``quality_check.blocked`` 且不向下游同步。
+    """
+    from app.services.data_transform import DataTransformService
+    svc = DataTransformService()
+    return svc.apply_transform(
+        rule_id=request.rule_id,
+        source_data=request.source_data,
+        idempotency_key=request.idempotency_key,
+    )
+
+
+@router.get("/quality-ledger")
+def pipeline_quality_ledger(
+    blocked: bool | None = None,
+    target_field: str | None = None,
+    source_module: str | None = None,
+    page: int = 1,
+    size: int = 20,
+) -> dict[str, Any]:
+    """质检台账查询：可核对实际转换值、采用来源及未采用的候选值。"""
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    return svc.query_quality_ledger(
+        blocked=blocked,
+        target_field=target_field,
+        source_module=source_module,
+        page=page,
+        size=size,
+    )
+
+
+@router.get("/quality-ledger/{entry_id}")
+def pipeline_quality_ledger_entry(entry_id: int) -> dict[str, Any]:
+    """质检台账明细：单条校验的完整取值明细与失败原因。"""
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    entry = svc.get_ledger_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"质检台账记录 {entry_id} 不存在")
+    return entry
 
 
 @router.post("/batch-validate")
